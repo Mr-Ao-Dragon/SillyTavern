@@ -373,6 +373,7 @@ export const settingsToUpdate = {
     scenario_format: ['#scenario_format_textarea', 'scenario_format', false, false],
     personality_format: ['#personality_format_textarea', 'personality_format', false, false],
     group_nudge_prompt: ['#group_nudge_prompt_textarea', 'group_nudge_prompt', false, false],
+    merge_group_nudge: ['#merge_group_nudge', 'merge_group_nudge', true, false],
     stream_openai: ['#stream_toggle', 'stream_openai', true, false],
     prompts: ['', 'prompts', false, false],
     prompt_order: ['', 'prompt_order', false, false],
@@ -433,6 +434,7 @@ const default_settings = {
     bias_presets: default_bias_presets,
     wi_format: default_wi_format,
     group_nudge_prompt: default_group_nudge_prompt,
+    merge_group_nudge: false,
     scenario_format: default_scenario_format,
     personality_format: default_personality_format,
     sort_models: 'alphabetically',
@@ -1078,10 +1080,14 @@ async function populateChatHistory(messages, prompts, chatCompletion, type = nul
     chatCompletion.freeBudget(newChatMessage);
     chatCompletion.insertAtStart(newChatMessage, 'chatHistory');
 
-    // Reserve budget for group nudge
+    // Insert and free group nudge
     if (selected_group && groupNudgeMessage) {
-        chatCompletion.freeBudget(groupNudgeMessage);
-        chatCompletion.insertAtEnd(groupNudgeMessage, 'chatHistory');
+        if (oai_settings.merge_group_nudge && await chatCompletion.mergeIntoTrailingSystemMessage(groupNudgeMessage, 'chatHistory')) {
+            // Merged into the trailing system message, its budget stays reserved.
+        } else {
+            chatCompletion.freeBudget(groupNudgeMessage);
+            chatCompletion.insertAtEnd(groupNudgeMessage, 'chatHistory');
+        }
     }
 
     // Insert and free continue nudge
@@ -1618,9 +1624,69 @@ export async function prepareOpenAIMessages({
     const eventData = { chat, dryRun };
     await eventSource.emit(event_types.CHAT_COMPLETION_PROMPT_READY, eventData);
 
+    if (oai_settings.merge_group_nudge && dryRun == false) {
+        mergeGroupNudgeIntoChat(chat);
+    }
+
     openai_messages_count = chat.filter(x => !x?.tool_calls && ['user', 'assistant', 'tool'].includes(x?.role)).length || 0;
 
     return [chat, promptManager.tokenHandler.counts];
+}
+
+/**
+ * Merges the group nudge message into the nearest preceding system message of the final chat.
+ * Runs after CHAT_COMPLETION_PROMPT_READY, so prompts injected by extensions (which appear
+ * only at that stage) are eligible merge targets as well. The search stops at the closest
+ * assistant message to keep the nudge from being moved deep into the chat history.
+ *
+ * @param {object[]} chat Flattened chat messages of the final prompt
+ * @returns {void}
+ */
+function mergeGroupNudgeIntoChat(chat) {
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return;
+    }
+
+    const nudgeContent = substituteParams(oai_settings.group_nudge_prompt);
+    if (!nudgeContent) {
+        return;
+    }
+
+    let nudgeIndex = -1;
+    for (let index = chat.length - 1; index >= 0; index--) {
+        const message = chat[index];
+        if (typeof message?.content === 'string' && message.content === nudgeContent) {
+            nudgeIndex = index;
+            break;
+        }
+    }
+
+    if (nudgeIndex < 0) {
+        return;
+    }
+
+    const newChatPrompts = [oai_settings.new_chat_prompt, oai_settings.new_group_chat_prompt]
+        .map(prompt => substituteParams(prompt).trim());
+
+    for (let index = nudgeIndex - 1; index >= 0; index--) {
+        const message = chat[index];
+        if (!message || typeof message.content !== 'string' || !message.content) {
+            continue;
+        }
+        if (message.role === 'assistant') {
+            return;
+        }
+        const isMergeTarget = message.role === 'system'
+            && !message.name
+            && !newChatPrompts.includes(message.content.trim());
+        if (!isMergeTarget) {
+            continue;
+        }
+        message.content += '\n' + nudgeContent;
+        chat.splice(nudgeIndex, 1);
+        console.log(`Merged group nudge into preceding system message at index ${index}`);
+        return;
+    }
 }
 
 /**
@@ -4072,6 +4138,41 @@ export class ChatCompletion {
         this.increaseTokenBudgetBy(message.getTokens());
 
         this.log(`Removed ${message.identifier} from ${identifier}. Remaining tokens: ${this.tokenBudget}`);
+    }
+
+    /**
+     * Merges a message into the trailing system message of the specified collection, if eligible.
+     * Mirrors the squash eligibility rules: system role, no name, not a new-chat marker.
+     *
+     * @param {Message} message - The message to merge.
+     * @param {string} identifier - The identifier of the collection to merge into.
+     * @returns {Promise<boolean>} True if the message was merged, false otherwise.
+     */
+    async mergeIntoTrailingSystemMessage(message, identifier) {
+        if (!message.content) {
+            return false;
+        }
+
+        const index = this.findMessageIndex(identifier);
+        if (-1 === index) {
+            return false;
+        }
+
+        const collection = this.messages.collection[index].collection;
+        const lastMessage = collection[collection.length - 1];
+        const canMerge = lastMessage
+            && lastMessage.role === 'system'
+            && !lastMessage.name
+            && !['newMainChat', 'newChat'].includes(lastMessage.identifier);
+
+        if (!canMerge) {
+            return false;
+        }
+
+        lastMessage.content += '\n' + message.content;
+        lastMessage.tokens = await tokenHandler.countAsync({ role: lastMessage.role, content: lastMessage.content });
+        this.log(`Merged ${message.identifier} into ${lastMessage.identifier}. Remaining tokens: ${this.tokenBudget}`);
+        return true;
     }
 
     /**
@@ -7029,6 +7130,11 @@ export function initOpenAI() {
 
     $('#squash_system_messages').on('input', function () {
         oai_settings.squash_system_messages = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#merge_group_nudge').on('input', function () {
+        oai_settings.merge_group_nudge = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
 
